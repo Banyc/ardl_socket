@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use ardl::{
     layer::{IObserver, SetUploadState, Uploader},
+    protocol::{
+        frag::{ACK_HDR_LEN, PUSH_HDR_LEN},
+        packet_hdr::PACKET_HDR_LEN,
+    },
     utils::buf::{BufSlice, BufWtr, OwnedBufWtr},
 };
 use tokio::{select, sync::mpsc, task::JoinHandle, time::Interval};
@@ -17,9 +21,10 @@ pub struct ArdlStreamUploader {
 impl ArdlStreamUploader {
     pub fn check_rep(&self) {}
 
-    pub async fn write(&mut self, slice: BufSlice) {
+    pub async fn write(&mut self, slice: BufSlice) -> Result<(), WriteError> {
         let mut some_slice = Some(slice);
         loop {
+            // assert: only enter the loop when there is something in `some_slice`
             let slice = some_slice.take().unwrap();
             match self.to_send_req.send_receive(slice).await {
                 Ok(response) => match response {
@@ -28,10 +33,11 @@ impl ArdlStreamUploader {
                         some_slice = Some(slice);
                     }
                 },
-                Err(_) => panic!(),
+                Err(_) => return Err(WriteError::RemoteClosedOrDownloaderDropped),
             }
             self.on_send_available_rx.notified().await;
         }
+        Ok(())
     }
 }
 
@@ -50,7 +56,14 @@ pub struct ArdlStreamUploaderBuilder {
 }
 
 impl ArdlStreamUploaderBuilder {
-    pub fn build(mut self) -> ArdlStreamUploader {
+    pub fn build(mut self) -> Result<ArdlStreamUploader, BuildError> {
+        if !(PACKET_HDR_LEN + PUSH_HDR_LEN + 1 <= self.mtu) {
+            return Err(BuildError::MtuTooSmall);
+        }
+        if !(PACKET_HDR_LEN + ACK_HDR_LEN <= self.mtu) {
+            return Err(BuildError::MtuTooSmall);
+        }
+
         let (to_send_req, to_send_res) = bmrng::channel(1);
 
         let on_send_available = Arc::new(tokio::sync::Notify::new());
@@ -63,6 +76,7 @@ impl ArdlStreamUploaderBuilder {
         self.ardl_uploader
             .set_on_send_available(Some(weak_observer));
 
+        let on_send_available_tx = Arc::clone(&on_send_available);
         let task = tokio::spawn(async move {
             uploading(
                 self.set_state_rx,
@@ -71,6 +85,7 @@ impl ArdlStreamUploaderBuilder {
                 self.mtu,
                 tokio::time::interval(self.flush_interval),
                 to_send_res,
+                on_send_available_tx,
             )
             .await;
         });
@@ -80,7 +95,7 @@ impl ArdlStreamUploaderBuilder {
             on_send_available_rx: on_send_available,
         };
         uploader.check_rep();
-        uploader
+        Ok(uploader)
     }
 }
 
@@ -91,16 +106,30 @@ async fn uploading(
     mtu: usize,
     mut flush_interval: Interval,
     mut to_send_res: bmrng::RequestReceiver<BufSlice, UploadingToSendResponse>,
+    on_send_available_tx: Arc<tokio::sync::Notify>,
 ) {
     loop {
         select! {
-            Some(state) = set_state_rx.recv() => {
-                ardl_uploader.set_state(state).unwrap();
-                match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
-                    Ok(_) => (),
-                    Err(e) => match e {
-                        OutputError::BufferTooSmall => panic!(),
-                        OutputError::SendBufferNotEnough => (),
+            option = set_state_rx.recv() => {
+                match option {
+                    Some(state) => {
+                        // assert: state produced by downloader has to be valid
+                        ardl_uploader.set_state(state).unwrap();
+                        match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
+                            Ok(_) => (),
+                            Err(e) => match e {
+                                OutputError::BufferTooSmall => panic!(),
+                                OutputError::SendBufferNotEnough => (),
+                                OutputError::OtherIoError(_) => {
+                                    // Remote UDP endpoint is closed
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // Downloader is dropped
+                        break;
                     }
                 }
             }
@@ -110,38 +139,68 @@ async fn uploading(
                     Err(e) => match e {
                         OutputError::BufferTooSmall => panic!(),
                         OutputError::SendBufferNotEnough => (),
-                    }
-                }
-            }
-            Ok((slice, responser)) = to_send_res.recv() => {
-                match ardl_uploader.to_send(slice) {
-                    Ok(_) => {
-                        responser.respond(UploadingToSendResponse::Ok)
-                            .map_err(|_|())
-                            .unwrap();
-                        match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
-                            Ok(_) => (),
-                            Err(e) => match e {
-                                OutputError::BufferTooSmall => panic!(),
-                                OutputError::SendBufferNotEnough => (),
-                            }
+                        OutputError::OtherIoError(_) => {
+                            // Remote UDP endpoint is closed
+                            break;
                         }
                     }
-                    Err(e) => responser
-                        .respond(UploadingToSendResponse::Err(e.0))
-                        .map_err(|_|())
-                        .unwrap(),
                 }
             }
-            else => panic!(),
+            result = to_send_res.recv() => {
+                match result {
+                    Ok((slice, responser)) => {
+                        match ardl_uploader.to_send(slice) {
+                            Ok(_) => {
+                                // assert: `to_send_req` won't die so soon
+                                responser.respond(UploadingToSendResponse::Ok)
+                                .map_err(|_|())
+                                .unwrap();
+                                match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
+                                    Ok(_) => (),
+                                    Err(e) => match e {
+                                        OutputError::BufferTooSmall => panic!(),
+                                        OutputError::SendBufferNotEnough => (),
+                                        OutputError::OtherIoError(_) => {
+                                            // Remote UDP endpoint is closed
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            // assert: `to_send_req` won't die so soon
+                            Err(e) => responser
+                                .respond(UploadingToSendResponse::Err(e.0))
+                                .map_err(|_|())
+                                .unwrap(),
+                        }
+                    }
+                    Err(_) => {
+                        // Uploader is dropped
+                        break;
+                    }
+                }
+            }
         }
     }
+    // Trigger errors on the other sides of those channels
+    on_send_available_tx.notify_one();
 }
 
 #[derive(Debug)]
 enum OutputError {
     BufferTooSmall,
     SendBufferNotEnough,
+    OtherIoError(io::Error),
+}
+
+#[derive(Debug)]
+pub enum WriteError {
+    RemoteClosedOrDownloaderDropped,
+}
+
+#[derive(Debug)]
+pub enum BuildError {
+    MtuTooSmall,
 }
 
 enum UploadingToSendResponse {
@@ -163,15 +222,23 @@ async fn output_all(
                     remote_addr,
                 } => match listener.send_to(wtr.data(), remote_addr).await {
                     Ok(_) => (),
-                    Err(_e) => {
-                        return Err(OutputError::SendBufferNotEnough);
-                    }
+                    Err(e) => match e.kind() {
+                        io::ErrorKind::OutOfMemory => {
+                            // TODO: make sure the right error kind
+                            return Err(OutputError::SendBufferNotEnough);
+                        }
+                        _ => return Err(OutputError::OtherIoError(e)),
+                    },
                 },
                 UdpEndpoint::Connection { connection } => match connection.send(wtr.data()).await {
                     Ok(_) => (),
-                    Err(_e) => {
-                        return Err(OutputError::SendBufferNotEnough);
-                    }
+                    Err(e) => match e.kind() {
+                        io::ErrorKind::OutOfMemory => {
+                            // TODO: make sure the right error kind
+                            return Err(OutputError::SendBufferNotEnough);
+                        }
+                        _ => return Err(OutputError::OtherIoError(e)),
+                    },
                 },
             },
             Err(e) => match e {

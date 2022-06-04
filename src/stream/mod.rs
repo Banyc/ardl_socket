@@ -1,4 +1,4 @@
-use std::{net::ToSocketAddrs, sync::Arc, time::Duration};
+use std::{io, net::ToSocketAddrs, sync::Arc, time::Duration};
 
 use ardl::{layer, utils::buf::OwnedBufWtr};
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
@@ -20,8 +20,11 @@ pub struct ArdlStreamBuilder {
 }
 
 impl ArdlStreamBuilder {
-    pub fn build(self) -> (ArdlStreamUploader, ArdlStreamDownloader) {
-        let (ardl_uploader, ardl_downloader) = self.ardl_builder.build().unwrap();
+    pub fn build(self) -> Result<(ArdlStreamUploader, ArdlStreamDownloader), BuildError> {
+        let (ardl_uploader, ardl_downloader) = self
+            .ardl_builder
+            .build()
+            .map_err(|e| BuildError::ArdlError(e))?;
         let (set_state_tx, set_state_rx) = mpsc::channel(1);
 
         let stream_uploader = ArdlStreamUploaderBuilder {
@@ -31,7 +34,8 @@ impl ArdlStreamBuilder {
             flush_interval: self.flush_interval,
             mtu: self.mtu,
         }
-        .build();
+        .build()
+        .map_err(|e| BuildError::UploaderError(e))?;
         let stream_downloader = ArdlStreamDownloaderBuilder {
             socket_recv_task: self.socket_recv_task,
             input_rx: self.input_rx,
@@ -39,21 +43,29 @@ impl ArdlStreamBuilder {
             set_state_tx,
         }
         .build();
-        (stream_uploader, stream_downloader)
+        Ok((stream_uploader, stream_downloader))
     }
 }
 
 pub async fn connect(
     addr: impl ToSocketAddrs,
     config: ArdlStreamConfig,
-) -> (ArdlStreamUploader, ArdlStreamDownloader) {
-    let addrs: Vec<_> = addr.to_socket_addrs().unwrap().collect();
+) -> Result<(ArdlStreamUploader, ArdlStreamDownloader), ConnectError> {
+    let addrs: Vec<_> = addr
+        .to_socket_addrs()
+        .map_err(|e| ConnectError::IoError(e))?
+        .collect();
 
     let udp_listener = match addrs[0].ip() {
+        // assert: the addr is legit
         std::net::IpAddr::V4(_) => UdpSocket::bind("0.0.0.0:0").await.unwrap(),
+        // assert: the addr is legit
         std::net::IpAddr::V6(_) => UdpSocket::bind("[::]:0").await.unwrap(),
     };
-    udp_listener.connect(addrs[0]).await.unwrap();
+    udp_listener
+        .connect(addrs[0])
+        .await
+        .map_err(|e| ConnectError::IoError(e))?;
     let udp_connection = Arc::new(udp_listener);
 
     let (input_tx, input_rx) = mpsc::channel(1);
@@ -62,9 +74,23 @@ pub async fn connect(
     let socket_recv_task = tokio::spawn(async move {
         loop {
             let mut buf = vec![0; mtu];
-            let len = udp_connection1.recv(&mut buf).await.unwrap();
+            let len = match udp_connection1.recv(&mut buf).await {
+                Ok(x) => x,
+                Err(_) => {
+                    // Remote UDP endpoint not reachable
+                    // Drop `input_tx` to inform `input_rx`
+                    break;
+                }
+            };
             let wtr = OwnedBufWtr::from_bytes(buf, 0, len);
-            input_tx.send(wtr).await.unwrap();
+            match input_tx.send(wtr).await {
+                Ok(_) => (),
+                Err(_) => {
+                    // `input_rx` is closed
+                    // No need to keep receiving from the UDP socket
+                    break;
+                }
+            }
         }
     });
 
@@ -79,6 +105,7 @@ pub async fn connect(
         ardl_builder: config.ardl_builder,
     }
     .build()
+    .map_err(|e| ConnectError::BuildError(e))
 }
 
 pub struct ArdlStreamConfig {
@@ -95,4 +122,16 @@ impl ArdlStreamConfig {
             ardl_builder: layer::Builder::default(),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum BuildError {
+    ArdlError(layer::BuildError),
+    UploaderError(uploader::BuildError),
+}
+
+#[derive(Debug)]
+pub enum ConnectError {
+    IoError(io::Error),
+    BuildError(BuildError),
 }

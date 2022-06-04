@@ -16,19 +16,25 @@ pub struct ArdlStreamDownloader {
 impl ArdlStreamDownloader {
     pub fn check_rep(&self) {}
 
-    pub async fn read(&mut self, len_cap: usize) -> BufSlice {
+    pub async fn read(&mut self, len_cap: usize) -> Result<BufSlice, ReadError> {
         loop {
-            match self.recv_req.send_receive(len_cap).await.unwrap() {
-                Some(x) => return x,
-                None => {
-                    self.on_receive_available_rx.notified().await;
-                }
+            match self.recv_req.send_receive(len_cap).await {
+                Ok(x) => match x {
+                    Some(x) => return Ok(x),
+                    None => {
+                        self.on_receive_available_rx.notified().await;
+                    }
+                },
+                Err(_) => return Err(ReadError::RemoteClosedOrUploaderDropped),
             }
         }
     }
 
-    pub async fn try_read(&mut self, len_cap: usize) -> Option<BufSlice> {
-        self.recv_req.send_receive(len_cap).await.unwrap()
+    pub async fn try_read(&mut self, len_cap: usize) -> Result<Option<BufSlice>, ReadError> {
+        self.recv_req
+            .send_receive(len_cap)
+            .await
+            .map_err(|_| ReadError::RemoteClosedOrUploaderDropped)
     }
 }
 
@@ -85,27 +91,52 @@ async fn downloading(
 ) {
     loop {
         select! {
-            Some(wtr) = input_rx.recv() => {
-                let rdr = BufSlice::from_wtr(wtr);
-                let set_upload_state = match ardl_downloader.input_packet(rdr) {
-                    Ok(x) => x,
-                    Err(_) => {
-                        // Ignore decoding errors
-                        continue;
+            option = input_rx.recv() => {
+                match option {
+                    Some(wtr) => {
+                        let rdr = BufSlice::from_wtr(wtr);
+                        let set_upload_state = match ardl_downloader.input_packet(rdr) {
+                            Ok(x) => x,
+                            Err(_) => {
+                                // Ignore decoding errors
+                                continue;
+                            }
+                        };
+                        match set_state_tx.send(set_upload_state).await {
+                            Ok(_) => (),
+                            Err(_) => {
+                                // Uploader is dropped
+                                break;
+                            }
+                        }
+                        on_receive_available_tx.notify_one();
                     }
-                };
-                set_state_tx
-                    .send(set_upload_state)
-                    .await
-                    .map_err(|_|())
-                    .unwrap();
-                on_receive_available_tx.notify_one();
+                    None => {
+                        // The remote UDP endpoint is closed
+                        break;
+                    }
+                }
             }
-            Ok((len_cap, responser)) = recv_res.recv() => {
-                let slice = ardl_downloader.recv_max(len_cap);
-                responser.respond(slice).map_err(|_|()).unwrap();
+            result = recv_res.recv() => {
+                match result {
+                    Ok((len_cap, responser)) => {
+                        let slice = ardl_downloader.recv_max(len_cap);
+                        // assert: requester won't die so soon
+                        responser.respond(slice).map_err(|_|()).unwrap();
+                    }
+                    Err(_) => {
+                        // Uploader is dropped
+                        break;
+                    }
+                }
             }
-            else => panic!(),
         }
     }
+    // Trigger errors on the other sides of those channels
+    on_receive_available_tx.notify_one();
+}
+
+#[derive(Debug)]
+pub enum ReadError {
+    RemoteClosedOrUploaderDropped,
 }

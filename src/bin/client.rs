@@ -7,9 +7,11 @@ use ardl_socket::stream::{self, ArdlStreamConfig};
 async fn main() {
     let config = ArdlStreamConfig::default();
 
-    let (mut uploader, mut downloader) = stream::connect("localhost:38947", config).await;
+    let (mut uploader, mut downloader) = stream::connect("localhost:38947", config).await.unwrap();
 
-    loop {
+    println!("[+] connected");
+
+    'outer: loop {
         let mut text = String::new();
         io::stdin().read_line(&mut text).unwrap();
         if text.ends_with("\n") {
@@ -20,20 +22,44 @@ async fn main() {
             continue;
         }
         let slice = BufSlice::from_bytes(bytes);
-        uploader.write(slice).await;
+        match uploader.write(slice).await {
+            Ok(_) => (),
+            Err(_) => {
+                println!("[-] remote UDP endpoint closed. Detected by `write`");
+                break;
+            }
+        }
 
-        let slice = downloader.read(1024).await;
+        let slice = match downloader.read(1024).await {
+            Ok(x) => x,
+            Err(_) => {
+                println!("[-] remote UDP endpoint closed. Detected by `read`");
+                break;
+            }
+        };
         println!(
             "{}, {:X?}",
             String::from_utf8_lossy(&slice.data()),
             slice.data()
         );
-        while let Some(slice) = downloader.try_read(1024).await {
-            println!(
-                "{}, {:X?}",
-                String::from_utf8_lossy(&slice.data()),
-                slice.data()
-            );
+        // check if there is more to read
+        loop {
+            match downloader.try_read(1024).await {
+                Ok(slice) => match slice {
+                    Some(slice) => {
+                        println!(
+                            "{}, {:X?}",
+                            String::from_utf8_lossy(&slice.data()),
+                            slice.data()
+                        );
+                    }
+                    None => break,
+                },
+                Err(_) => {
+                    println!("[-] remote UDP endpoint closed. Detected by `read`");
+                    break 'outer;
+                }
+            }
         }
     }
 }

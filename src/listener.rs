@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::stream::{
-    ArdlStreamBuilder, ArdlStreamConfig, ArdlStreamDownloader, ArdlStreamUploader,
+    self, ArdlStreamBuilder, ArdlStreamConfig, ArdlStreamDownloader, ArdlStreamUploader,
 };
 
 pub struct ArdlListener {
@@ -60,13 +60,16 @@ impl ArdlListener {
     pub async fn accept(
         &self,
         config: ArdlStreamConfig,
-    ) -> (ArdlStreamUploader, ArdlStreamDownloader, SocketAddr) {
+    ) -> Result<(ArdlStreamUploader, ArdlStreamDownloader, SocketAddr), AcceptError> {
         let accept = loop {
-            match self.accept_req.send_receive(()).await.unwrap() {
-                Some(x) => break x,
-                None => {
-                    self.on_available_accept.notified().await;
-                }
+            match self.accept_req.send_receive(()).await {
+                Ok(x) => match x {
+                    Some(x) => break x,
+                    None => {
+                        self.on_available_accept.notified().await;
+                    }
+                },
+                Err(_) => return Err(AcceptError::UdpError),
             }
         };
         let stream = ArdlStreamBuilder {
@@ -80,8 +83,9 @@ impl ArdlListener {
             input_rx: accept.input_rx,
             ardl_builder: config.ardl_builder,
         }
-        .build();
-        (stream.0, stream.1, accept.remote_addr)
+        .build()
+        .map_err(|e| AcceptError::BuildError(e))?;
+        Ok((stream.0, stream.1, accept.remote_addr))
     }
 }
 
@@ -105,7 +109,15 @@ async fn listening(
     let mut bytes = vec![0; mtu];
     loop {
         select! {
-            Ok((len, remote_addr)) = udp_listener.recv_from(&mut bytes) => {
+            result = udp_listener.recv_from(&mut bytes) => {
+                let (len, remote_addr) = match result {
+                    Ok(x) => x,
+                    Err(_) => {
+                        // Listener is dropped or errors from `udp_listener`
+                        break;
+                    }
+                };
+
                 let wtr = OwnedBufWtr::from_bytes(bytes, 0, len);
                 bytes = vec![0; mtu];
 
@@ -143,25 +155,47 @@ async fn listening(
                     }
                 }
             }
-            Ok((_, responser)) = accept_res.recv() => {
+            result = accept_res.recv() => {
+                let (_, responser) = match result {
+                    Ok(x) => x,
+                    Err(_) => {
+                        // Listener is dropped
+                        break;
+                    }
+                };
+
                 match accept_queue.pop_front() {
                     Some(accept) => {
+                        // assert: because the relative items are each added to `accept_queue` and `pending_downloaders`, it must match
                         let downloader = pending_downloaders.remove(&accept.remote_addr).unwrap();
                         accepted_downloaders.insert(accept.remote_addr, downloader);
+                        // assert:
+                        // - `accept_req` is in `self`
+                        // - `accept_res` is in `self.task` which aborts when `self` drops
                         responser.respond(Some(accept)).unwrap();
                     }
                     None => {
+                        // assert:
+                        // - `accept_req` is in `self`
+                        // - `accept_res` is in `self.task` which aborts when `self` drops
                         responser.respond(None).unwrap();
                     }
                 };
             }
-            else => panic!(),
         }
     }
+    // Trigger errors on the other sides of those channels
+    on_available_accept_tx.notify_one();
 }
 
 #[derive(Debug)]
 struct DownloadPath {
     remote_addr: SocketAddr,
     input_rx: mpsc::Receiver<OwnedBufWtr>,
+}
+
+#[derive(Debug)]
+pub enum AcceptError {
+    BuildError(stream::BuildError),
+    UdpError,
 }
