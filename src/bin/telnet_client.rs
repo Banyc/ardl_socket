@@ -3,10 +3,12 @@ use std::io;
 use ardl::utils::buf::BufSlice;
 use ardl_socket::stream::{self, ConnectConfig};
 
+const LISTEN_ADDR: &str = "0.0.0.0:38947";
+
 #[tokio::main]
 async fn main() {
     let config = ConnectConfig::default();
-    let (mut uploader, mut downloader) = stream::connect("localhost:38947", config).await.unwrap();
+    let (mut uploader, mut downloader) = stream::connect(LISTEN_ADDR, config).await.unwrap();
 
     println!("[+] connected");
 

@@ -3,12 +3,12 @@ use ardl_socket::{
     stream::ArdlStreamConfig,
 };
 
+const LISTEN_ADDR: &str = "0.0.0.0:38947";
+
 #[tokio::main]
 async fn main() {
     let bind_config = BindConfig::default();
-    let listener = ArdlListener::bind("localhost:38947", bind_config)
-        .await
-        .unwrap();
+    let listener = ArdlListener::bind(LISTEN_ADDR, bind_config).await.unwrap();
 
     loop {
         let config = ArdlStreamConfig::default();
@@ -30,11 +30,11 @@ async fn main() {
                         break;
                     }
                 };
-                println!(
-                    "{}, {:X?}",
-                    String::from_utf8_lossy(&slice.data()),
-                    slice.data()
-                );
+                // println!(
+                //     "{}, {:X?}",
+                //     String::from_utf8_lossy(&slice.data()),
+                //     slice.data()
+                // );
 
                 match uploader.write(slice).await {
                     Ok(x) => x,
