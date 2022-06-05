@@ -1,6 +1,6 @@
 use ardl_socket::{
-    listener::{ArdlListener, BindConfig},
-    stream::ArdlStreamConfig,
+    sockets::{ArdlListener, BindConfig},
+    streams::ArdlStreamConfig,
 };
 
 const LISTEN_ADDR: &str = "0.0.0.0:38947";

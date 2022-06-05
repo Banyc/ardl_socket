@@ -1,3 +1,8 @@
+use ardl::utils::buf::{BufSlice, BufWtr, OwnedBufWtr};
+use ardl_socket::{
+    sockets::{self, ConnectConfig},
+    streams::ArdlStreamDownloader,
+};
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
@@ -6,9 +11,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use ardl::utils::buf::{BufSlice, BufWtr, OwnedBufWtr};
-use ardl_socket::stream::{self, ArdlStreamDownloader, ConnectConfig};
 
 const LISTEN_ADDR: &str = "0.0.0.0:38947";
 const SOURCE_FILE_NAME: &str = "Free_Test_Data_10MB_MP4.upload.mp4";
@@ -32,7 +34,7 @@ async fn main() {
 
     // connection
     let config = ConnectConfig::default();
-    let (mut uploader, downloader) = stream::connect(LISTEN_ADDR, config).await.unwrap();
+    let (mut uploader, downloader) = sockets::connect(LISTEN_ADDR, config).await.unwrap();
 
     println!("[+] connected");
 

@@ -1,5 +1,4 @@
 use std::{net::SocketAddr, sync::Arc};
-
 use tokio::net::UdpSocket;
 
 pub enum UdpEndpoint {

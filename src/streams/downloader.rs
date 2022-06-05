@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
 use ardl::{
     layer::{Downloader, SetUploadState},
     utils::buf::BufSlice,
 };
+use std::sync::Arc;
 use tokio::{select, sync::mpsc, task::JoinHandle};
 
 pub struct ArdlStreamDownloader {

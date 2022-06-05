@@ -1,14 +1,13 @@
-use std::io;
-
 use ardl::utils::buf::BufSlice;
-use ardl_socket::stream::{self, ConnectConfig};
+use ardl_socket::sockets::{self, ConnectConfig};
+use std::io;
 
 const LISTEN_ADDR: &str = "0.0.0.0:38947";
 
 #[tokio::main]
 async fn main() {
     let config = ConnectConfig::default();
-    let (mut uploader, mut downloader) = stream::connect(LISTEN_ADDR, config).await.unwrap();
+    let (mut uploader, mut downloader) = sockets::connect(LISTEN_ADDR, config).await.unwrap();
 
     println!("[+] connected");
 

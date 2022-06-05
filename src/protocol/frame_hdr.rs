@@ -1,7 +1,6 @@
-use std::io::Cursor;
-
 use ardl::utils::buf::{BufSlice, BufWtr};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::io::Cursor;
 
 pub struct FrameHdr {
     id: u32,
