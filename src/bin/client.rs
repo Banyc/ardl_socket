@@ -1,12 +1,11 @@
 use std::io;
 
 use ardl::utils::buf::BufSlice;
-use ardl_socket::stream::{self, ArdlStreamConfig};
+use ardl_socket::stream::{self, ConnectConfig};
 
 #[tokio::main]
 async fn main() {
-    let config = ArdlStreamConfig::default();
-
+    let config = ConnectConfig::default();
     let (mut uploader, mut downloader) = stream::connect("localhost:38947", config).await.unwrap();
 
     println!("[+] connected");
