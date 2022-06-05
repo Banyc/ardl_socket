@@ -3,6 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use ardl::utils::buf::{BufSlice, OwnedBufWtr};
@@ -11,6 +12,7 @@ use tokio::{
     select,
     sync::mpsc,
     task::JoinHandle,
+    time::interval,
 };
 
 use crate::{
@@ -28,23 +30,21 @@ pub struct ArdlListener {
 impl ArdlListener {
     pub fn check_rep(&self) {}
 
-    pub async fn bind(addr: impl ToSocketAddrs) -> Result<Self, io::Error> {
+    pub async fn bind(addr: impl ToSocketAddrs, config: BindConfig) -> Result<Self, io::Error> {
         let udp_listener = Arc::new(UdpSocket::bind(addr).await?);
         let udp_listener_accept = Arc::clone(&udp_listener);
 
-        let mtu = 1300;
-        let accept_queue_len_cap = 1024;
-        // let (accept_tx, accept_rx) = mpsc::channel(accept_queue_len_cap);
         let (accept_req, accept_res) = bmrng::channel(1);
         let on_available_accept = Arc::new(tokio::sync::Notify::new());
         let on_available_accept_tx = Arc::clone(&on_available_accept);
         let task = tokio::spawn(async move {
             listening(
-                mtu,
+                config.mtu,
                 udp_listener_accept,
-                accept_queue_len_cap,
+                config.accept_queue_len_cap,
                 accept_res,
                 on_available_accept_tx,
+                config.inactive_timeout,
             )
             .await;
         });
@@ -103,14 +103,28 @@ async fn listening(
     accept_queue_len_cap: usize,
     mut accept_res: bmrng::RequestReceiver<(), Option<StreamRx>>,
     on_available_accept_tx: Arc<tokio::sync::Notify>,
+    inactive_timeout: Duration,
 ) {
     let mut accepted_downloaders: HashMap<u32, StreamTx> = HashMap::new();
     let mut pending_downloaders: HashMap<u32, StreamTx> = HashMap::new();
     let mut accept_queue = VecDeque::with_capacity(accept_queue_len_cap);
 
     let mut bytes = vec![0; mtu];
+    let mut clean_inactive_timeout_interval = interval(inactive_timeout);
     loop {
         select! {
+            _ = clean_inactive_timeout_interval.tick() => {
+                let now = Instant::now();
+                let mut to_remove = Vec::new();
+                for (&id, stream_tx) in &accepted_downloaders {
+                    if !(now.duration_since(stream_tx.last_recv) < inactive_timeout) {
+                        to_remove.push(id);
+                    }
+                }
+                for id in to_remove {
+                    accepted_downloaders.remove(&id);
+                }
+            }
             result = udp_listener.recv_from(&mut bytes) => {
                 let (len, remote_addr) = match result {
                     Ok(x) => x,
@@ -152,6 +166,7 @@ async fn listening(
                         let stream_tx = StreamTx {
                             remote_addr,
                             input_tx,
+                            last_recv: Instant::now(),
                         };
                         pending_downloaders.insert(frame_hdr.id(), stream_tx);
                         accept_queue.push_back(stream_rx);
@@ -238,10 +253,27 @@ struct StreamRx {
 struct StreamTx {
     remote_addr: SocketAddr,
     input_tx: mpsc::Sender<BufSlice>,
+    last_recv: Instant,
 }
 
 #[derive(Debug)]
 pub enum AcceptError {
     BuildError(stream::BuildError),
     UdpError,
+}
+
+pub struct BindConfig {
+    pub mtu: usize,
+    pub inactive_timeout: Duration,
+    pub accept_queue_len_cap: usize,
+}
+
+impl BindConfig {
+    pub fn default() -> Self {
+        BindConfig {
+            mtu: 1300,
+            inactive_timeout: Duration::from_secs(300),
+            accept_queue_len_cap: 1280,
+        }
+    }
 }

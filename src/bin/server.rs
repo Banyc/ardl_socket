@@ -1,8 +1,14 @@
-use ardl_socket::{listener::ArdlListener, stream::ArdlStreamConfig};
+use ardl_socket::{
+    listener::{ArdlListener, BindConfig},
+    stream::ArdlStreamConfig,
+};
 
 #[tokio::main]
 async fn main() {
-    let listener = ArdlListener::bind("localhost:38947").await.unwrap();
+    let bind_config = BindConfig::default();
+    let listener = ArdlListener::bind("localhost:38947", bind_config)
+        .await
+        .unwrap();
 
     loop {
         let config = ArdlStreamConfig::default();
