@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ardl::{
     layer::{Downloader, SetUploadState},
-    utils::buf::{BufSlice, OwnedBufWtr},
+    utils::buf::BufSlice,
 };
 use tokio::{select, sync::mpsc, task::JoinHandle};
 
@@ -49,7 +49,7 @@ impl Drop for ArdlStreamDownloader {
 
 pub struct ArdlStreamDownloaderBuilder {
     pub socket_recv_task: Option<JoinHandle<()>>,
-    pub input_rx: mpsc::Receiver<OwnedBufWtr>,
+    pub input_rx: mpsc::Receiver<BufSlice>,
     pub ardl_downloader: Downloader,
     pub set_state_tx: mpsc::Sender<SetUploadState>,
 }
@@ -83,7 +83,7 @@ impl ArdlStreamDownloaderBuilder {
 }
 
 async fn downloading(
-    mut input_rx: mpsc::Receiver<OwnedBufWtr>,
+    mut input_rx: mpsc::Receiver<BufSlice>,
     mut ardl_downloader: Downloader,
     set_state_tx: mpsc::Sender<SetUploadState>,
     on_receive_available_tx: Arc<tokio::sync::Notify>,
@@ -93,9 +93,8 @@ async fn downloading(
         select! {
             option = input_rx.recv() => {
                 match option {
-                    Some(wtr) => {
-                        let rdr = BufSlice::from_wtr(wtr);
-                        let set_upload_state = match ardl_downloader.input_packet(rdr) {
+                    Some(slice) => {
+                        let set_upload_state = match ardl_downloader.input_packet(slice) {
                             Ok(x) => x,
                             Err(_) => {
                                 // Ignore decoding errors

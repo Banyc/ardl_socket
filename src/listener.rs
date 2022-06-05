@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use ardl::utils::buf::OwnedBufWtr;
+use ardl::utils::buf::{BufSlice, OwnedBufWtr};
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
     select,
@@ -13,15 +13,16 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::stream::{
-    self, ArdlStreamBuilder, ArdlStreamConfig, ArdlStreamDownloader, ArdlStreamUploader,
+use crate::{
+    protocol::FrameHdr,
+    stream::{self, ArdlStreamBuilder, ArdlStreamConfig, ArdlStreamDownloader, ArdlStreamUploader},
 };
 
 pub struct ArdlListener {
     task: JoinHandle<()>,
     udp_listener: Arc<UdpSocket>,
     on_available_accept: Arc<tokio::sync::Notify>,
-    accept_req: bmrng::RequestSender<(), Option<DownloadPath>>,
+    accept_req: bmrng::RequestSender<(), Option<StreamRx>>,
 }
 
 impl ArdlListener {
@@ -60,8 +61,8 @@ impl ArdlListener {
     pub async fn accept(
         &self,
         config: ArdlStreamConfig,
-    ) -> Result<(ArdlStreamUploader, ArdlStreamDownloader, SocketAddr), AcceptError> {
-        let accept = loop {
+    ) -> Result<(ArdlStreamUploader, ArdlStreamDownloader, SocketAddr, u32), AcceptError> {
+        let stream_rx = loop {
             match self.accept_req.send_receive(()).await {
                 Ok(x) => match x {
                     Some(x) => break x,
@@ -75,17 +76,18 @@ impl ArdlListener {
         let stream = ArdlStreamBuilder {
             udp_endpoint: crate::utils::UdpEndpoint::Listener {
                 listener: Arc::clone(&self.udp_listener),
-                remote_addr: accept.remote_addr,
+                remote_addr: stream_rx.remote_addr,
             },
             flush_interval: config.flush_interval,
             mtu: config.mtu,
             socket_recv_task: None,
-            input_rx: accept.input_rx,
+            input_rx: stream_rx.input_rx,
             ardl_builder: config.ardl_builder,
+            id: stream_rx.id,
         }
         .build()
         .map_err(|e| AcceptError::BuildError(e))?;
-        Ok((stream.0, stream.1, accept.remote_addr))
+        Ok((stream.0, stream.1, stream_rx.remote_addr, stream_rx.id))
     }
 }
 
@@ -99,11 +101,11 @@ async fn listening(
     mtu: usize,
     udp_listener: Arc<UdpSocket>,
     accept_queue_len_cap: usize,
-    mut accept_res: bmrng::RequestReceiver<(), Option<DownloadPath>>,
+    mut accept_res: bmrng::RequestReceiver<(), Option<StreamRx>>,
     on_available_accept_tx: Arc<tokio::sync::Notify>,
 ) {
-    let mut accepted_downloaders: HashMap<SocketAddr, mpsc::Sender<OwnedBufWtr>> = HashMap::new();
-    let mut pending_downloaders: HashMap<SocketAddr, mpsc::Sender<OwnedBufWtr>> = HashMap::new();
+    let mut accepted_downloaders: HashMap<u32, StreamTx> = HashMap::new();
+    let mut pending_downloaders: HashMap<u32, StreamTx> = HashMap::new();
     let mut accept_queue = VecDeque::with_capacity(accept_queue_len_cap);
 
     let mut bytes = vec![0; mtu];
@@ -120,38 +122,75 @@ async fn listening(
 
                 let wtr = OwnedBufWtr::from_bytes(bytes, 0, len);
                 bytes = vec![0; mtu];
+                let mut slice = BufSlice::from_wtr(wtr);
 
-                let mut try_accept = |wtr| {
+                // Decode frame header
+                let frame_hdr = match FrameHdr::from_slice(&mut slice) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+
+                if let Some(_) = pending_downloaders.get(&frame_hdr.id()) {
+                    // The default local rwnd size is zero, no rwnd update until this ID is accepted and the first remote push is acknowledged
+                    // Don't care until it is accepted
+                    continue;
+                }
+
+                // Closure
+                let mut try_enqueue_accept = |slice| {
                     if accept_queue.len() < accept_queue_len_cap {
                         let (input_tx, input_rx) = mpsc::channel(1);
-                        let _ = input_tx.try_send(wtr);
-                        let accept = DownloadPath {
+
+                        // The first RTO will be so long that it is wiser to acknowledge this first push ASAP before the peer retransmits it much later
+                        let _ = input_tx.try_send(slice);
+
+                        let stream_rx = StreamRx {
                             remote_addr,
                             input_rx,
+                            id: frame_hdr.id(),
                         };
-                        pending_downloaders.insert(remote_addr, input_tx);
-                        accept_queue.push_back(accept);
+                        let stream_tx = StreamTx {
+                            remote_addr,
+                            input_tx,
+                        };
+                        pending_downloaders.insert(frame_hdr.id(), stream_tx);
+                        accept_queue.push_back(stream_rx);
                         on_available_accept_tx.notify_one();
                     }
                 };
 
-                match accepted_downloaders.get(&remote_addr) {
-                    Some(input_tx) => {
-                        match input_tx.try_send(wtr) {
-                            Ok(_) => (),
-                            Err(e) => match e {
-                                // drop overflowed packets
-                                mpsc::error::TrySendError::Full(_) => (),
-                                // remove closed downloader
-                                mpsc::error::TrySendError::Closed(wtr) => {
-                                    accepted_downloaders.remove(&remote_addr);
-                                    try_accept(wtr);
+                // Ensure created session for this ID and pass packet to the downloader
+                match accepted_downloaders.get(&frame_hdr.id()) {
+                    Some(stream_tx) => {
+                        // This is an existing and accepted ID
+                        match remote_addr == stream_tx.remote_addr {
+                            true => {
+                                match stream_tx.input_tx.try_send(slice) {
+                                    Ok(_) => (),
+                                    Err(e) => match e {
+                                        // Drop overflowed packets
+                                        mpsc::error::TrySendError::Full(_) => (),
+                                        // Remove closed downloader
+                                        mpsc::error::TrySendError::Closed(slice) => {
+                                            accepted_downloaders.remove(&frame_hdr.id());
+                                            try_enqueue_accept(slice);
+                                        }
+                                    }
                                 }
+                            }
+                            false => {
+                                // Might be an replay attack from the other source
+                                // Ignore
+
+                                // accepted_downloaders.remove(&frame_hdr.id());
+                                // try_enqueue_accept(slice);
                             }
                         }
                     }
                     None => {
-                        try_accept(wtr);
+                        // Neither is this frame ID pending nor accepted
+                        // Attempt to enqueue this ID
+                        try_enqueue_accept(slice);
                     }
                 }
             }
@@ -165,14 +204,14 @@ async fn listening(
                 };
 
                 match accept_queue.pop_front() {
-                    Some(accept) => {
+                    Some(stream_rx) => {
                         // assert: because the relative items are each added to `accept_queue` and `pending_downloaders`, it must match
-                        let downloader = pending_downloaders.remove(&accept.remote_addr).unwrap();
-                        accepted_downloaders.insert(accept.remote_addr, downloader);
+                        let stream_tx = pending_downloaders.remove(&stream_rx.id).unwrap();
+                        accepted_downloaders.insert(stream_rx.id, stream_tx);
                         // assert:
                         // - `accept_req` is in `self`
                         // - `accept_res` is in `self.task` which aborts when `self` drops
-                        responser.respond(Some(accept)).unwrap();
+                        responser.respond(Some(stream_rx)).unwrap();
                     }
                     None => {
                         // assert:
@@ -189,9 +228,16 @@ async fn listening(
 }
 
 #[derive(Debug)]
-struct DownloadPath {
+struct StreamRx {
     remote_addr: SocketAddr,
-    input_rx: mpsc::Receiver<OwnedBufWtr>,
+    input_rx: mpsc::Receiver<BufSlice>,
+    id: u32,
+}
+
+#[derive(Debug)]
+struct StreamTx {
+    remote_addr: SocketAddr,
+    input_tx: mpsc::Sender<BufSlice>,
 }
 
 #[derive(Debug)]

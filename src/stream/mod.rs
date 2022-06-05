@@ -1,9 +1,12 @@
 use std::{io, net::ToSocketAddrs, sync::Arc, time::Duration};
 
-use ardl::{layer, utils::buf::OwnedBufWtr};
+use ardl::{
+    layer,
+    utils::buf::{BufSlice, OwnedBufWtr},
+};
 use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 
-use crate::utils::UdpEndpoint;
+use crate::{protocol::FrameHdr, utils::UdpEndpoint};
 
 mod downloader;
 pub use downloader::*;
@@ -15,8 +18,9 @@ pub struct ArdlStreamBuilder {
     pub flush_interval: std::time::Duration,
     pub mtu: usize,
     pub socket_recv_task: Option<JoinHandle<()>>,
-    pub input_rx: mpsc::Receiver<OwnedBufWtr>,
+    pub input_rx: mpsc::Receiver<BufSlice>,
     pub ardl_builder: layer::Builder,
+    pub id: u32,
 }
 
 impl ArdlStreamBuilder {
@@ -33,6 +37,7 @@ impl ArdlStreamBuilder {
             set_state_rx,
             flush_interval: self.flush_interval,
             mtu: self.mtu,
+            id: self.id,
         }
         .build()
         .map_err(|e| BuildError::UploaderError(e))?;
@@ -71,6 +76,7 @@ pub async fn connect(
     let (input_tx, input_rx) = mpsc::channel(1);
     let udp_connection1 = Arc::clone(&udp_connection);
     let mtu = config.mtu;
+    let id: u32 = rand::random();
     let socket_recv_task = tokio::spawn(async move {
         loop {
             let mut buf = vec![0; mtu];
@@ -83,7 +89,19 @@ pub async fn connect(
                 }
             };
             let wtr = OwnedBufWtr::from_bytes(buf, 0, len);
-            match input_tx.send(wtr).await {
+            let mut slice = BufSlice::from_wtr(wtr);
+
+            // Decode frame header
+            let frame_hdr = match FrameHdr::from_slice(&mut slice) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            // Allow only frame with valid ID
+            if frame_hdr.id() != id {
+                continue;
+            }
+
+            match input_tx.send(slice).await {
                 Ok(_) => (),
                 Err(_) => {
                     // `input_rx` is closed
@@ -103,6 +121,7 @@ pub async fn connect(
         socket_recv_task: Some(socket_recv_task),
         input_rx,
         ardl_builder: config.ardl_builder,
+        id,
     }
     .build()
     .map_err(|e| ConnectError::BuildError(e))

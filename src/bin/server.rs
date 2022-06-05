@@ -7,9 +7,10 @@ async fn main() {
     loop {
         let config = ArdlStreamConfig::default();
 
-        let (mut uploader, mut downloader, remote_addr) = listener.accept(config).await.unwrap();
+        let (mut uploader, mut downloader, remote_addr, id) =
+            listener.accept(config).await.unwrap();
 
-        println!("[+] accepted {}", remote_addr);
+        println!("[+] accepted {{ {}, {} }}", remote_addr, id);
 
         tokio::spawn(async move {
             loop {

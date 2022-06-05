@@ -10,7 +10,10 @@ use ardl::{
 };
 use tokio::{select, sync::mpsc, task::JoinHandle, time::Interval};
 
-use crate::utils::UdpEndpoint;
+use crate::{
+    protocol::{FrameBuilder, FRAME_HDR_LEN},
+    utils::UdpEndpoint,
+};
 
 pub struct ArdlStreamUploader {
     task: JoinHandle<()>,
@@ -53,14 +56,15 @@ pub struct ArdlStreamUploaderBuilder {
     pub set_state_rx: mpsc::Receiver<SetUploadState>,
     pub flush_interval: std::time::Duration,
     pub mtu: usize,
+    pub id: u32,
 }
 
 impl ArdlStreamUploaderBuilder {
     pub fn build(mut self) -> Result<ArdlStreamUploader, BuildError> {
-        if !(PACKET_HDR_LEN + PUSH_HDR_LEN + 1 <= self.mtu) {
+        if !(FRAME_HDR_LEN + PACKET_HDR_LEN + PUSH_HDR_LEN + 1 <= self.mtu) {
             return Err(BuildError::MtuTooSmall);
         }
-        if !(PACKET_HDR_LEN + ACK_HDR_LEN <= self.mtu) {
+        if !(FRAME_HDR_LEN + PACKET_HDR_LEN + ACK_HDR_LEN <= self.mtu) {
             return Err(BuildError::MtuTooSmall);
         }
 
@@ -86,6 +90,7 @@ impl ArdlStreamUploaderBuilder {
                 tokio::time::interval(self.flush_interval),
                 to_send_res,
                 on_send_available_tx,
+                self.id,
             )
             .await;
         });
@@ -107,7 +112,15 @@ async fn uploading(
     mut flush_interval: Interval,
     mut to_send_res: bmrng::RequestReceiver<BufSlice, UploadingToSendResponse>,
     on_send_available_tx: Arc<tokio::sync::Notify>,
+    id: u32,
 ) {
+    let mut wtr = OwnedBufWtr::new(mtu, 0);
+
+    // Encode frame header
+    let frame_hdr = FrameBuilder { id }.build();
+    // Write frame header
+    frame_hdr.append_to(&mut wtr).unwrap();
+
     loop {
         select! {
             option = set_state_rx.recv() => {
@@ -115,7 +128,7 @@ async fn uploading(
                     Some(state) => {
                         // assert: state produced by downloader has to be valid
                         ardl_uploader.set_state(state).unwrap();
-                        match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
+                        match output_all(&mut ardl_uploader, &udp_endpoint, &mut wtr).await {
                             Ok(_) => (),
                             Err(e) => match e {
                                 OutputError::BufferTooSmall => panic!(),
@@ -134,7 +147,7 @@ async fn uploading(
                 }
             }
             _now = flush_interval.tick() => {
-                match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
+                match output_all(&mut ardl_uploader, &udp_endpoint, &mut wtr).await {
                     Ok(_) => (),
                     Err(e) => match e {
                         OutputError::BufferTooSmall => panic!(),
@@ -155,7 +168,7 @@ async fn uploading(
                                 responser.respond(UploadingToSendResponse::Ok)
                                 .map_err(|_|())
                                 .unwrap();
-                                match output_all(&mut ardl_uploader, &udp_endpoint, mtu).await {
+                                match output_all(&mut ardl_uploader, &udp_endpoint, &mut wtr).await {
                                     Ok(_) => (),
                                     Err(e) => match e {
                                         OutputError::BufferTooSmall => panic!(),
@@ -211,36 +224,43 @@ enum UploadingToSendResponse {
 async fn output_all(
     uploader: &mut Uploader,
     udp_endpoint: &UdpEndpoint,
-    mtu: usize,
+    wtr: &mut impl BufWtr,
 ) -> Result<(), OutputError> {
+    let data_len_then = wtr.data_len();
     loop {
-        let mut wtr = OwnedBufWtr::new(mtu, 0);
-        match uploader.output_packet(&mut wtr) {
-            Ok(_) => match udp_endpoint {
-                UdpEndpoint::Listener {
-                    listener,
-                    remote_addr,
-                } => match listener.send_to(wtr.data(), remote_addr).await {
-                    Ok(_) => (),
-                    Err(e) => match e.kind() {
-                        io::ErrorKind::OutOfMemory => {
-                            // TODO: make sure the right error kind
-                            return Err(OutputError::SendBufferNotEnough);
-                        }
-                        _ => return Err(OutputError::OtherIoError(e)),
+        match uploader.output_packet(wtr) {
+            Ok(_) => {
+                match udp_endpoint {
+                    UdpEndpoint::Listener {
+                        listener,
+                        remote_addr,
+                    } => match listener.send_to(wtr.data(), remote_addr).await {
+                        Ok(_) => (),
+                        Err(e) => match e.kind() {
+                            io::ErrorKind::OutOfMemory => {
+                                // TODO: make sure the right error kind
+                                return Err(OutputError::SendBufferNotEnough);
+                            }
+                            _ => return Err(OutputError::OtherIoError(e)),
+                        },
                     },
-                },
-                UdpEndpoint::Connection { connection } => match connection.send(wtr.data()).await {
-                    Ok(_) => (),
-                    Err(e) => match e.kind() {
-                        io::ErrorKind::OutOfMemory => {
-                            // TODO: make sure the right error kind
-                            return Err(OutputError::SendBufferNotEnough);
+                    UdpEndpoint::Connection { connection } => {
+                        match connection.send(wtr.data()).await {
+                            Ok(_) => (),
+                            Err(e) => match e.kind() {
+                                io::ErrorKind::OutOfMemory => {
+                                    // TODO: make sure the right error kind
+                                    return Err(OutputError::SendBufferNotEnough);
+                                }
+                                _ => return Err(OutputError::OtherIoError(e)),
+                            },
                         }
-                        _ => return Err(OutputError::OtherIoError(e)),
-                    },
-                },
-            },
+                    }
+                }
+
+                // Reset wtr
+                wtr.shrink_back(wtr.data_len() - data_len_then).unwrap();
+            }
             Err(e) => match e {
                 ardl::layer::OutputError::NothingToOutput => break,
                 ardl::layer::OutputError::BufferTooSmall => {
