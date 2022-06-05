@@ -18,7 +18,8 @@ use crate::{
 pub struct ArdlStreamUploader {
     task: JoinHandle<()>,
     to_send_req: bmrng::RequestSender<BufSlice, UploadingToSendResponse>,
-    on_send_available_rx: Arc<tokio::sync::Notify>,
+    // The observer passed to `ardl::layer::uploader` is a weak reference, so we need to keep a strong reference
+    on_send_available_observer: Arc<OnSendAvailable>,
 }
 
 impl ArdlStreamUploader {
@@ -38,7 +39,7 @@ impl ArdlStreamUploader {
                 },
                 Err(_) => return Err(WriteError::RemoteClosedOrDownloaderDropped),
             }
-            self.on_send_available_rx.notified().await;
+            self.on_send_available_observer.notifier.notified().await;
         }
         Ok(())
     }
@@ -73,7 +74,7 @@ impl ArdlStreamUploaderBuilder {
         let on_send_available = Arc::new(tokio::sync::Notify::new());
         let on_send_available_tx = Arc::clone(&on_send_available);
         let observer = OnSendAvailable {
-            tx: on_send_available_tx,
+            notifier: on_send_available_tx,
         };
         let observer = Arc::new(observer);
         let weak_observer = Arc::downgrade(&observer);
@@ -97,7 +98,7 @@ impl ArdlStreamUploaderBuilder {
         let uploader = ArdlStreamUploader {
             task,
             to_send_req,
-            on_send_available_rx: on_send_available,
+            on_send_available_observer: observer,
         };
         uploader.check_rep();
         Ok(uploader)
@@ -273,11 +274,11 @@ async fn output_all(
 }
 
 struct OnSendAvailable {
-    tx: Arc<tokio::sync::Notify>,
+    notifier: Arc<tokio::sync::Notify>,
 }
 
 impl IObserver for OnSendAvailable {
     fn notify(&self) {
-        let _result = self.tx.notify_one();
+        self.notifier.notify_one();
     }
 }
