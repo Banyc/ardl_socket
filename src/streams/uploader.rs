@@ -67,7 +67,7 @@ impl ArdlStreamUploaderBuilder {
             return Err(BuildError::MtuTooSmall);
         }
 
-        let (to_send_req, to_send_res) = bmrng::channel(1);
+        let (to_send_req, to_send_res) = bmrng::channel(128);
 
         let on_send_available = Arc::new(tokio::sync::Notify::new());
         let on_send_available_tx = Arc::clone(&on_send_available);

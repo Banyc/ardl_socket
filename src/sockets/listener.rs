@@ -34,7 +34,7 @@ impl ArdlListener {
         let udp_listener = Arc::new(UdpSocket::bind(addr).await?);
         let udp_listener_accept = Arc::clone(&udp_listener);
 
-        let (accept_req, accept_res) = bmrng::channel(1);
+        let (accept_req, accept_res) = bmrng::channel(128);
         let on_available_accept = Arc::new(tokio::sync::Notify::new());
         let on_available_accept_tx = Arc::clone(&on_available_accept);
         let task = tokio::spawn(async move {
@@ -153,7 +153,7 @@ async fn listening(
                 // Closure
                 let mut try_enqueue_accept = |slice| {
                     if accept_queue.len() < accept_queue_len_cap {
-                        let (input_tx, input_rx) = mpsc::channel(1);
+                        let (input_tx, input_rx) = mpsc::channel(128);
 
                         // The first RTO will be so long that it is wiser to acknowledge this first push ASAP before the peer retransmits it much later
                         let _ = input_tx.try_send(slice);

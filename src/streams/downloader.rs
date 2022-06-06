@@ -55,7 +55,7 @@ pub struct ArdlStreamDownloaderBuilder {
 
 impl ArdlStreamDownloaderBuilder {
     pub fn build(self) -> ArdlStreamDownloader {
-        let (recv_req, recv_res) = bmrng::channel(1);
+        let (recv_req, recv_res) = bmrng::channel(128);
         let on_receive_available = Arc::new(tokio::sync::Notify::new());
         let on_receive_available_tx = Arc::clone(&on_receive_available);
 

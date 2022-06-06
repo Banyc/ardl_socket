@@ -35,7 +35,7 @@ pub async fn connect(
         .map_err(|e| ConnectError::IoError(e))?;
     let udp_connection = Arc::new(udp_listener);
 
-    let (input_tx, input_rx) = mpsc::channel(1);
+    let (input_tx, input_rx) = mpsc::channel(128);
     let udp_connection1 = Arc::clone(&udp_connection);
     let mtu = config.stream.mtu;
     let id: u32 = rand::random();

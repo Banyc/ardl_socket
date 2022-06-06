@@ -24,7 +24,7 @@ impl ArdlStreamBuilder {
             .ardl_builder
             .build()
             .map_err(|e| BuildError::ArdlError(e))?;
-        let (set_state_tx, set_state_rx) = mpsc::channel(1);
+        let (set_state_tx, set_state_rx) = mpsc::channel(128);
 
         let stream_uploader = ArdlStreamUploaderBuilder {
             udp_endpoint: self.udp_endpoint,
