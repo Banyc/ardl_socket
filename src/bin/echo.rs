@@ -20,7 +20,7 @@ async fn main() {
 
         tokio::spawn(async move {
             loop {
-                let slice = match downloader.read(1024).await {
+                let slice = match downloader.read(1024 * 64).await {
                     Ok(x) => x,
                     Err(_) => {
                         println!(
