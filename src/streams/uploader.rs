@@ -240,19 +240,29 @@ async fn output_all(
                     UdpEndpoint::Listener {
                         listener,
                         remote_addr,
-                    } => match listener.send_to(wtr.data(), remote_addr).await {
-                        Ok(_) => (),
-                        Err(e) => match e.kind() {
-                            io::ErrorKind::ConnectionRefused => {
-                                return Err(OutputError::ConnectionRefused);
-                            }
-                            _ => {
-                                return Err(OutputError::OtherIoError(e));
-                            }
-                        },
-                    },
+                    } => {
+                        let result = listener.send_to(wtr.data(), remote_addr).await;
+                        // Reset wtr
+                        wtr.shrink_back(wtr.data_len() - data_len_then).unwrap();
+
+                        match result {
+                            Ok(_) => (),
+                            Err(e) => match e.kind() {
+                                io::ErrorKind::ConnectionRefused => {
+                                    return Err(OutputError::ConnectionRefused);
+                                }
+                                _ => {
+                                    return Err(OutputError::OtherIoError(e));
+                                }
+                            },
+                        }
+                    }
                     UdpEndpoint::Connection { connection } => {
-                        match connection.send(wtr.data()).await {
+                        let result = connection.send(wtr.data()).await;
+                        // Reset wtr
+                        wtr.shrink_back(wtr.data_len() - data_len_then).unwrap();
+
+                        match result {
                             Ok(_) => (),
                             Err(e) => match e.kind() {
                                 io::ErrorKind::ConnectionRefused => {
@@ -265,9 +275,6 @@ async fn output_all(
                         }
                     }
                 }
-
-                // Reset wtr
-                wtr.shrink_back(wtr.data_len() - data_len_then).unwrap();
             }
             Err(e) => match e {
                 ardl::layer::OutputError::NothingToOutput => break,
