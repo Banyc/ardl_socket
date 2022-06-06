@@ -131,10 +131,12 @@ async fn uploading(
                             Ok(_) => (),
                             Err(e) => match e {
                                 OutputError::BufferTooSmall => panic!(),
-                                OutputError::SendBufferNotEnough => (),
-                                OutputError::OtherIoError(_) => {
+                                OutputError::ConnectionRefused => {
                                     // Remote UDP endpoint is closed
                                     break;
+                                }
+                                OutputError::OtherIoError(_) => {
+                                    // No buffer space available (os error 55)
                                 }
                             }
                         }
@@ -150,10 +152,12 @@ async fn uploading(
                     Ok(_) => (),
                     Err(e) => match e {
                         OutputError::BufferTooSmall => panic!(),
-                        OutputError::SendBufferNotEnough => (),
-                        OutputError::OtherIoError(_) => {
+                        OutputError::ConnectionRefused => {
                             // Remote UDP endpoint is closed
                             break;
+                        }
+                        OutputError::OtherIoError(_) => {
+                            // No buffer space available (os error 55)
                         }
                     }
                 }
@@ -171,10 +175,12 @@ async fn uploading(
                                     Ok(_) => (),
                                     Err(e) => match e {
                                         OutputError::BufferTooSmall => panic!(),
-                                        OutputError::SendBufferNotEnough => (),
-                                        OutputError::OtherIoError(_) => {
+                                        OutputError::ConnectionRefused => {
                                             // Remote UDP endpoint is closed
                                             break;
+                                        }
+                                        OutputError::OtherIoError(_) => {
+                                            // No buffer space available (os error 55)
                                         }
                                     }
                                 }
@@ -201,7 +207,8 @@ async fn uploading(
 #[derive(Debug)]
 enum OutputError {
     BufferTooSmall,
-    SendBufferNotEnough,
+    ConnectionRefused,
+    // SendBufferNotEnough
     OtherIoError(io::Error),
 }
 
@@ -236,22 +243,24 @@ async fn output_all(
                     } => match listener.send_to(wtr.data(), remote_addr).await {
                         Ok(_) => (),
                         Err(e) => match e.kind() {
-                            io::ErrorKind::OutOfMemory => {
-                                // TODO: make sure the right error kind
-                                return Err(OutputError::SendBufferNotEnough);
+                            io::ErrorKind::ConnectionRefused => {
+                                return Err(OutputError::ConnectionRefused);
                             }
-                            _ => return Err(OutputError::OtherIoError(e)),
+                            _ => {
+                                return Err(OutputError::OtherIoError(e));
+                            }
                         },
                     },
                     UdpEndpoint::Connection { connection } => {
                         match connection.send(wtr.data()).await {
                             Ok(_) => (),
                             Err(e) => match e.kind() {
-                                io::ErrorKind::OutOfMemory => {
-                                    // TODO: make sure the right error kind
-                                    return Err(OutputError::SendBufferNotEnough);
+                                io::ErrorKind::ConnectionRefused => {
+                                    return Err(OutputError::ConnectionRefused);
                                 }
-                                _ => return Err(OutputError::OtherIoError(e)),
+                                _ => {
+                                    return Err(OutputError::OtherIoError(e));
+                                }
                             },
                         }
                     }
